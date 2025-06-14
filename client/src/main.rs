@@ -1,7 +1,84 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use websocket::{ClientBuilder, Message, OwnedMessage};
 use websocket::header::q;
+use photon;
+
+type RegionPingData = HashMap<String, (u128, SystemTime)>;
+
+async fn fetch_regions_once() -> Vec<photon::PhotonRegion> {
+    println!("Fetching regions...");
+    let regions = photon::get_regions_async();
+    println!("Found {} regions. Pinging...", regions.len());
+    regions
+}
+
+async fn ping_cached_regions(regions: &[photon::PhotonRegion]) -> Vec<(photon::PhotonRegion, u128)> {
+    println!("Pinging {} cached regions...", regions.len());
+    let handles: Vec<_> = regions
+        .iter()
+        .cloned()
+        .map(|region| {
+            tokio::spawn(async move {
+                let pinger = photon::Pinger::new(&region);
+                let latency = pinger.start_ping(20);
+                (region, latency)
+            })
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(pair) => results.push(pair),
+            Err(e) => eprintln!("A task panicked: {e:?}"),
+        }
+    }
+
+    results
+}
+
+fn start_background_pinger(ping_data: Arc<Mutex<RegionPingData>>) {
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cached_regions = rt.block_on(fetch_regions_once());
+        
+        loop {
+            println!("Starting ping cycle...");
+
+            let ping_results = rt.block_on(ping_cached_regions(&cached_regions));
+
+            {
+                let mut data = ping_data.lock().unwrap();
+                let now = SystemTime::now();
+                
+                for (region, latency) in ping_results {
+                    let region_name = format!("{:?}", region);
+                    data.insert(region_name.clone(), (latency, now));
+                    println!("{}: {:?}", region_name, latency);
+                }
+            }
+            
+            println!("Ping cycle finished.");
+            thread::sleep(Duration::from_secs(30));
+        }
+    });
+}
+
+fn get_ping_data_json(ping_data: &Arc<Mutex<RegionPingData>>) -> String {
+    let data = ping_data.lock().unwrap();
+    let mut json = Vec::new();
+    
+    for (region, (latency, last_updated)) in data.iter() {
+        let timestamp = last_updated.duration_since(UNIX_EPOCH).unwrap().as_millis();
+        
+        json.push(format!(r#"{{"region": "{}", "latency": {}, "last_updated": {}}}"#, region, latency, timestamp));
+    }
+    
+    format!("[{}]", json.join(","))
+}
 
 fn main() {
     let mut client = ClientBuilder::new("ws://127.0.0.1:8080")
@@ -9,6 +86,10 @@ fn main() {
         .connect_insecure()
         .unwrap();
 
+    let ping_data = Arc::new(Mutex::new(HashMap::new()));
+    
+    start_background_pinger(Arc::clone(&ping_data));
+    
     let (mut receiver, mut sender) = client.split().unwrap();
 
     for message in receiver.incoming_messages() {
@@ -73,6 +154,10 @@ fn main() {
                     } else {
                         println!("Invalid play message format: {}", text);
                     }
+                }
+                else if text.starts_with("GET_PING_DATA:") {
+                    let json_data = get_ping_data_json(&ping_data);
+                    sender.send_message(&OwnedMessage::Text(json_data));
                 }
             }
             _ => {

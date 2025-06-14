@@ -1,5 +1,8 @@
+use crossbeam_channel::{unbounded, Sender, Receiver};
 use std::net::TcpStream;
 use std::string::ToString;
+use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::Instant;
 use websocket::{ClientBuilder, OwnedMessage};
 use websocket::sync::{Writer};
@@ -8,7 +11,8 @@ use crate::message_type::EgMessageType;
 use crate::parameter_codes::{ADDRESS, REGION};
 use crate::parameter_dictionary::{ParameterDictionary, Value};
 use crate::parameter_dictionary::Value::Int;
-use crate::pinger::Pinger;
+pub use crate::photon_region::PhotonRegion;
+pub use crate::pinger::Pinger;
 use crate::protocol_v18::{deserialize_operation_response, serialize_operation_request};
 use crate::stream_buffer::StreamBuffer;
 
@@ -21,14 +25,42 @@ mod operation_response;
 mod parameter_codes;
 mod pinger;
 mod gp_type;
+mod photon_region;
 
 const MESSAGE_HEADER: [u8; 2] = [243, 2];
 static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
+static SUBSCRIBERS: OnceLock<Mutex<Vec<Sender<Vec<PhotonRegion>>>>> = OnceLock::new();
+static START_WORKER: OnceLock<()> = OnceLock::new();
 const APP_ID: &str = "0d501af7-d643-47dd-811a-cfc25ef543be";
 
 #[inline]
 fn millis_since_start() -> u64 {
     START_TIME.elapsed().as_millis() as u64
+}
+
+pub fn get_regions_async() -> Vec<PhotonRegion> {
+    subscribe().recv().expect("Region fetcher failed before returning cleanly")
+}
+
+fn broadcast_regions(regions: &Vec<PhotonRegion>) {
+    if let Some(mutex) = SUBSCRIBERS.get() {
+        let subscribers = mutex.lock().unwrap();
+        for s in subscribers.iter() {
+            // Ignore failures (e.g., if the receiver was dropped).
+            let _ = s.send(regions.to_vec());
+        }
+    }
+}
+
+fn subscribe() -> Receiver<Vec<PhotonRegion>> { 
+    let subs_mutex = SUBSCRIBERS.get_or_init(|| Mutex::new(Vec::new()));
+    START_WORKER.get_or_init(|| {
+        thread::spawn(photon_worker);
+    });
+    
+    let (tx, rx) = unbounded();
+    subs_mutex.lock().unwrap().push(tx);
+    rx
 }
 
 fn serialize_operation_to_message(opcode: u8, param_dict: ParameterDictionary, message_type: EgMessageType) -> Vec<u8> {
@@ -128,31 +160,36 @@ fn deserialize_message_and_callback(stream: &mut StreamBuffer, sender: &mut Writ
             let op_res = protocol_v18::deserialize_operation_response(stream);
             if op_res.return_code != 0 {
                 println!("Operation failed: {:?}", op_res);
-                return;           
+                return;
             }
             match op_res.operation_code {
                 220 => {
-                    let regions = match op_res.payload.get(REGION) {
+                    let region_shortnames = match op_res.payload.get(REGION) {
                         Some(Value::StringArray(regions)) => regions,
                         _ => {
                             println!("No regions received");
                             return
-                        }       
+                        }
                     };
                     let addresses = match op_res.payload.get(ADDRESS) {
                         Some(Value::StringArray(addresses)) => addresses,
                         _ => {
                             println!("No addresses received");
                             return
-                        }       
+                        }
                     };
-                    let intended_region = "us";
-                    let region_index = regions.iter().position(|region| region == intended_region).unwrap();
-                    let mut pinger = Pinger::new(&addresses[region_index], 5055, &regions[region_index]);
-                    let results = pinger.start_ping(10);
-                    println!("Regions");
+                    
+                    // For each region, construct a new PhotonRegion and then broadcast back to subscribers
+                    let mut regions: Vec<PhotonRegion> = Vec::new();
+                    for i in 0..region_shortnames.len() {
+                        regions.push(PhotonRegion{
+                            short_name: region_shortnames[i].clone(),
+                            address: addresses[i].clone()
+                        })
+                    }
+                    broadcast_regions(&regions);
                 }
-                _ => {}           
+                _ => {}
             }
             println!("Operation Response: {:?}", op_res);
         }
@@ -164,7 +201,7 @@ fn deserialize_message_and_callback(stream: &mut StreamBuffer, sender: &mut Writ
     }
 }
 
-fn main() {
+fn photon_worker() {
     // Open a websocket to ws://ns.photonengine.io:80 with a subprotocol with name "GpBinaryV18"
     let client = ClientBuilder::new("wss://ns.photonengine.io:80")
         .unwrap()
