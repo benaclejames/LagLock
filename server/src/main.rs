@@ -118,6 +118,17 @@ fn send_play_message_to_all(clients: &ClientsRegistry, message: &str) {
     println!("Sent play message to all clients with future timestamp: {}", future_timestamp);
 }
 
+fn request_photon_pings_from_all(clients: &ClientsRegistry) {
+    for (addr, client_data) in clients.lock().unwrap().iter() {
+        if let Ok(mut locked_client) = client_data.lock() {
+            match locked_client.client.send_message(&OwnedMessage::Text("REQUEST_PING:".to_string())) {
+                Ok(_) => println!("Sent ping message to client {}", addr),
+                Err(e) => println!("Error sending ping message to client {}: {:?}", addr, e),
+            }
+        }
+    }
+}
+
 fn main() {
     // Create a WebSocket server that will listen on 127.0.0.1:8080
     let server = Server::bind("127.0.0.1:8080").unwrap();
@@ -291,6 +302,12 @@ fn main() {
                                         format!("Play message '{}' sent to all clients", message_content)
                                     ));
                                 }
+                            } else if text.starts_with("REQUEST_PING:") {
+                                println!("Received command to request photon pings from all clients");
+                                request_photon_pings_from_all(&thread_clients);
+                            } else if text.starts_with("PHOTON_PINGS:") {
+                                let json_content = text.trim_start_matches("PHOTON_PINGS:");
+                                
                             } else {
                                 // Echo text messages back to the client
                                 if let Ok(mut locked_client_data) = client_data.lock() {

@@ -77,7 +77,7 @@ fn get_ping_data_json(ping_data: &Arc<Mutex<RegionPingData>>) -> String {
         json.push(format!(r#"{{"region": "{}", "latency": {}, "last_updated": {}}}"#, region, latency, timestamp));
     }
     
-    format!("[{}]", json.join(","))
+    format!("PHOTON_PINGS:[{}]", json.join(","))
 }
 
 fn main() {
@@ -155,7 +155,7 @@ fn main() {
                         println!("Invalid play message format: {}", text);
                     }
                 }
-                else if text.starts_with("GET_PING_DATA:") {
+                else if text.starts_with("REQUEST_PING:") {
                     let json_data = get_ping_data_json(&ping_data);
                     sender.send_message(&OwnedMessage::Text(json_data));
                 }
