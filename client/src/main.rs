@@ -2,21 +2,39 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use websocket::{ClientBuilder, Message, OwnedMessage};
-use websocket::header::q;
+use websocket::{ClientBuilder, OwnedMessage};
+use serde::{Serialize, Deserialize};
 use photon;
 
 type RegionPingData = HashMap<String, (u128, SystemTime)>;
 
+#[derive(Serialize, Deserialize)]
+struct RegionPingInfo {
+    region: String,
+    latency: u128,
+    last_updated: u128,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PhotonPingsResponse {
+    regions: Vec<RegionPingInfo>,
+}
+
 async fn fetch_regions_once() -> Vec<photon::PhotonRegion> {
-    println!("Fetching regions...");
+    if cfg!(debug_assertions) {
+        println!("Fetching regions...");
+    }
     let regions = photon::get_regions_async();
-    println!("Found {} regions. Pinging...", regions.len());
+    if cfg!(debug_assertions) {
+        println!("Found {} regions", regions.len());
+    }
     regions
 }
 
 async fn ping_cached_regions(regions: &[photon::PhotonRegion]) -> Vec<(photon::PhotonRegion, u128)> {
-    println!("Pinging {} cached regions...", regions.len());
+    if cfg!(debug_assertions) {
+        println!("Pinging {} regions...", regions.len());
+    }
     let handles: Vec<_> = regions
         .iter()
         .cloned()
@@ -44,40 +62,56 @@ fn start_background_pinger(ping_data: Arc<Mutex<RegionPingData>>) {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let cached_regions = rt.block_on(fetch_regions_once());
-        
+
         loop {
-            println!("Starting ping cycle...");
+            if cfg!(debug_assertions) {
+                println!("Starting ping cycle...");
+            }
 
             let ping_results = rt.block_on(ping_cached_regions(&cached_regions));
 
             {
                 let mut data = ping_data.lock().unwrap();
                 let now = SystemTime::now();
-                
+
                 for (region, latency) in ping_results {
-                    let region_name = format!("{:?}", region);
+                    let region_name = region.short_name.clone();
                     data.insert(region_name.clone(), (latency, now));
-                    println!("{}: {:?}", region_name, latency);
+
+                    // Log only if needed for debugging
+                    if cfg!(debug_assertions) {
+                        println!("Region {}: {}ms", region_name, latency);
+                    }
                 }
             }
-            
-            println!("Ping cycle finished.");
+
+            if cfg!(debug_assertions) {
+                println!("Ping cycle finished.");
+            }
             thread::sleep(Duration::from_secs(30));
         }
     });
 }
 
-fn get_ping_data_json(ping_data: &Arc<Mutex<RegionPingData>>) -> String {
+fn get_ping_data_json(ping_data: &Arc<Mutex<RegionPingData>>, target_region: &str) -> String {
     let data = ping_data.lock().unwrap();
-    let mut json = Vec::new();
-    
+    let mut regions = Vec::new();
+
     for (region, (latency, last_updated)) in data.iter() {
-        let timestamp = last_updated.duration_since(UNIX_EPOCH).unwrap().as_millis();
-        
-        json.push(format!(r#"{{"region": "{}", "latency": {}, "last_updated": {}}}"#, region, latency, timestamp));
+        // If a target region is specified, only include data for that region
+        if target_region.is_empty() || region == target_region {
+            let timestamp = last_updated.duration_since(UNIX_EPOCH).unwrap().as_millis();
+
+            regions.push(RegionPingInfo {
+                region: region.clone(),
+                latency: *latency,
+                last_updated: timestamp,
+            });
+        }
     }
-    
-    format!("PHOTON_PINGS:[{}]", json.join(","))
+
+    let response = PhotonPingsResponse { regions };
+    format!("PHOTON_PINGS:{}", serde_json::to_string(&response).unwrap())
 }
 
 fn main() {
@@ -87,9 +121,9 @@ fn main() {
         .unwrap();
 
     let ping_data = Arc::new(Mutex::new(HashMap::new()));
-    
+
     start_background_pinger(Arc::clone(&ping_data));
-    
+
     let (mut receiver, mut sender) = client.split().unwrap();
 
     for message in receiver.incoming_messages() {
@@ -108,11 +142,12 @@ fn main() {
                     let current_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis();
                     let time_difference = current_timestamp - sent_timestamp;
 
-                    println!("sent_timestamp: {}", sent_timestamp);
-                    println!("rtt {}", rtt);
-                    println!("time_diff: {}", time_difference);
+                    // Log only if needed for debugging
+                    if cfg!(debug_assertions) {
+                        println!("Ping - Server timestamp: {}, RTT: {}ms, Time diff: {}ms", 
+                                 sent_timestamp, rtt, time_difference);
+                    }
                 }
-                println!("Ping: {:?}", ping);
                 sender.send_message(&OwnedMessage::Pong(ping));
             }
             OwnedMessage::Text(text) => {
@@ -156,7 +191,16 @@ fn main() {
                     }
                 }
                 else if text.starts_with("REQUEST_PING:") {
-                    let json_data = get_ping_data_json(&ping_data);
+                    // Check if a specific region is requested
+                    let parts: Vec<&str> = text.splitn(2, ':').collect();
+                    let target_region = if parts.len() > 1 && !parts[1].is_empty() {
+                        parts[1]
+                    } else {
+                        // If no region specified, use all regions
+                        ""
+                    };
+
+                    let json_data = get_ping_data_json(&ping_data, target_region);
                     sender.send_message(&OwnedMessage::Text(json_data));
                 }
             }

@@ -5,6 +5,19 @@ use websocket::OwnedMessage;
 use std::sync::{Arc, Mutex};
 use std::collections::{VecDeque, HashMap};
 use std::net::SocketAddr;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct RegionPingInfo {
+    region: String,
+    latency: u128,
+    last_updated: u128,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PhotonPingsResponse {
+    regions: Vec<RegionPingInfo>,
+}
 
 // Structure to store client data including ping history
 struct ClientData {
@@ -14,6 +27,10 @@ struct ClientData {
     ping_history: VecDeque<(u128, u128)>,
     // Smoothed ping (average over last 30 seconds)
     smoothed_ping: Option<u128>,
+    // Photon ping data received from client
+    photon_pings: Option<Vec<RegionPingInfo>>,
+    // Flag to indicate if we're waiting for photon ping data
+    waiting_for_photon_pings: bool,
 }
 
 impl ClientData {
@@ -23,6 +40,8 @@ impl ClientData {
             client,
             ping_history: VecDeque::new(),
             smoothed_ping: None,
+            photon_pings: None,
+            waiting_for_photon_pings: false,
         }
     }
 
@@ -34,10 +53,12 @@ impl ClientData {
         // Calculate the smoothed ping (average of pings in the last 30 seconds)
         self.update_smoothed_ping();
 
-        // Log the current ping and smoothed ping
-        println!("Current ping: {} ms, Smoothed ping: {} ms", 
-                 latency, 
-                 self.smoothed_ping.unwrap_or(0));
+        // Log the current ping and smoothed ping if in debug mode
+        if cfg!(debug_assertions) {
+            println!("Current ping: {} ms, Smoothed ping: {} ms", 
+                     latency, 
+                     self.smoothed_ping.unwrap_or(0));
+        }
     }
 
     // Update the smoothed ping based on the ping history
@@ -49,7 +70,7 @@ impl ClientData {
             .as_millis();
 
         // Keep only pings from the last 30 seconds
-        let thirty_seconds_ago = now - 60_000;
+        let thirty_seconds_ago = now - 30_000;
         while let Some((timestamp, _)) = self.ping_history.front() {
             if *timestamp < thirty_seconds_ago {
                 self.ping_history.pop_front();
@@ -71,31 +92,84 @@ impl ClientData {
 // Create a type alias for our clients registry
 type ClientsRegistry = Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<ClientData>>>>>;
 
+// Default target region for photon pings
+const DEFAULT_TARGET_REGION: &str = "us";
+
 // Function to get the highest RTT among all connected clients
-fn get_highest_rtt(clients: &ClientsRegistry) -> u128 {
+fn get_highest_rtt(clients: &ClientsRegistry, target_region: &str) -> u128 {
     let locked_clients = clients.lock().unwrap();
-    let mut highest_rtt = 0;
+    let mut highest_server_ping = 0;
+    let mut highest_photon_ping = 0;
 
     for (_, client_data) in locked_clients.iter() {
         if let Ok(locked_client) = client_data.lock() {
+            // Check server-client ping
             if let Some(rtt) = locked_client.smoothed_ping {
-                highest_rtt = highest_rtt.max(rtt);
+                highest_server_ping = highest_server_ping.max(rtt);
+            }
+
+            // Check photon pings if available
+            if let Some(photon_pings) = &locked_client.photon_pings {
+                for ping_info in photon_pings {
+                    // Only consider pings for the target region
+                    if ping_info.region == target_region {
+                        highest_photon_ping = highest_photon_ping.max(ping_info.latency);
+                    }
+                }
             }
         }
     }
 
-    highest_rtt
+    // Return the sum of the highest server ping and the highest photon ping
+    highest_server_ping + highest_photon_ping
 }
 
 // Function to send a play message to all clients with a future timestamp
-fn send_play_message_to_all(clients: &ClientsRegistry, message: &str) {
+fn send_play_message_to_all(clients: &ClientsRegistry, message: &str, target_region: &str) {
+    // First, request photon pings from all clients for the target region
+    println!("Requesting photon pings from all clients for region {} before sending play message", target_region);
+    request_photon_pings_from_all(clients, target_region);
+
+    // Wait for all clients to respond with their photon pings (with a timeout)
+    let max_wait_time = Duration::from_secs(2); // Maximum wait time of 2 seconds
+    let start_time = SystemTime::now();
+
+    let mut all_clients_responded = false;
+    while !all_clients_responded && SystemTime::now().duration_since(start_time).unwrap() < max_wait_time {
+        // Check if all clients have responded
+        all_clients_responded = true;
+
+        let locked_clients = clients.lock().unwrap();
+        for (_, client_data) in locked_clients.iter() {
+            if let Ok(locked_client) = client_data.lock() {
+                if locked_client.waiting_for_photon_pings {
+                    // At least one client is still waiting for photon pings
+                    all_clients_responded = false;
+                    break;
+                }
+            }
+        }
+
+        if !all_clients_responded {
+            // Sleep a short time before checking again
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    if !all_clients_responded {
+        println!("Not all clients responded with photon pings within the timeout period");
+    } else {
+        println!("All clients responded with photon pings");
+    }
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_millis();
 
-    // Get the highest RTT among all clients
-    let highest_rtt = get_highest_rtt(clients);
+    // Get the highest RTT among all clients (sum of highest server ping and highest photon ping for the target region)
+    let highest_rtt = get_highest_rtt(clients, target_region);
+    println!("Highest RTT (sum of highest server ping and highest photon ping for region {}): {} ms", target_region, highest_rtt);
 
     // Calculate a future timestamp that gives all clients enough time to receive and process the message
     // We multiply by 1.5 to add some buffer
@@ -118,11 +192,20 @@ fn send_play_message_to_all(clients: &ClientsRegistry, message: &str) {
     println!("Sent play message to all clients with future timestamp: {}", future_timestamp);
 }
 
-fn request_photon_pings_from_all(clients: &ClientsRegistry) {
+fn request_photon_pings_from_all(clients: &ClientsRegistry, target_region: &str) {
     for (addr, client_data) in clients.lock().unwrap().iter() {
         if let Ok(mut locked_client) = client_data.lock() {
-            match locked_client.client.send_message(&OwnedMessage::Text("REQUEST_PING:".to_string())) {
-                Ok(_) => println!("Sent ping message to client {}", addr),
+            // Mark that we're waiting for photon pings from this client
+            locked_client.waiting_for_photon_pings = true;
+            // Clear any previous photon ping data
+            locked_client.photon_pings = None;
+
+            match locked_client.client.send_message(&OwnedMessage::Text(format!("REQUEST_PING:{}", target_region))) {
+                Ok(_) => {
+                    if cfg!(debug_assertions) {
+                        println!("Sent ping message to client {} for region {}", addr, target_region);
+                    }
+                },
                 Err(e) => println!("Error sending ping message to client {}: {:?}", addr, e),
             }
         }
@@ -194,7 +277,9 @@ fn main() {
                             // Send message with timestamp and estimated ping
                             let message = OwnedMessage::Ping(vec![timestamp_bytes, cur_ping_bytes].concat());
 
-                            println!("Sending ping to client {} with timestamp {}", ip, now);
+                            if cfg!(debug_assertions) {
+                                println!("Sending ping to client {} with timestamp {}", ip, now);
+                            }
                             if let Err(e) = locked_client_data.client.send_message(&message) {
                                 println!("Error sending ping to client {}: {:?}", ip, e);
                                 break;
@@ -260,8 +345,6 @@ fn main() {
 
                     // Process the message
                     let message = message_option.unwrap();
-
-                    // Process the message
                     match message {
                         OwnedMessage::Close(_) => {
                             // Client wants to close connection
@@ -290,11 +373,21 @@ fn main() {
 
                             // Check if this is a command to send a play message to all clients
                             if text.starts_with("SEND_PLAY:") {
-                                let message_content = text.trim_start_matches("SEND_PLAY:");
-                                println!("Received command to send play message: {}", message_content);
+                                // Check if format is SEND_PLAY:message or SEND_PLAY:region:message
+                                let parts: Vec<&str> = text.trim_start_matches("SEND_PLAY:").splitn(2, ':').collect();
+
+                                let (target_region, message_content) = if parts.len() > 1 {
+                                    // Format is SEND_PLAY:region:message
+                                    (parts[0], parts[1])
+                                } else {
+                                    // Format is SEND_PLAY:message, use default region
+                                    (DEFAULT_TARGET_REGION, parts[0])
+                                };
+
+                                println!("Received command to send play message: {} for region: {}", message_content, target_region);
 
                                 // Send play message to all clients
-                                send_play_message_to_all(&thread_clients, message_content);
+                                send_play_message_to_all(&thread_clients, message_content, target_region);
 
                                 // Also send confirmation to the client that sent the command
                                 if let Ok(mut locked_client_data) = client_data.lock() {
@@ -303,11 +396,52 @@ fn main() {
                                     ));
                                 }
                             } else if text.starts_with("REQUEST_PING:") {
-                                println!("Received command to request photon pings from all clients");
-                                request_photon_pings_from_all(&thread_clients);
+                                // Check if a specific region is requested
+                                let parts: Vec<&str> = text.splitn(2, ':').collect();
+                                let target_region = if parts.len() > 1 && !parts[1].is_empty() {
+                                    parts[1]
+                                } else {
+                                    DEFAULT_TARGET_REGION
+                                };
+
+                                if cfg!(debug_assertions) {
+                                    println!("Received command to request photon pings from all clients for region {}", target_region);
+                                }
+                                request_photon_pings_from_all(&thread_clients, target_region);
                             } else if text.starts_with("PHOTON_PINGS:") {
                                 let json_content = text.trim_start_matches("PHOTON_PINGS:");
-                                
+                                match serde_json::from_str::<PhotonPingsResponse>(json_content) {
+                                    Ok(response) => {
+                                        if cfg!(debug_assertions) {
+                                            println!("Received photon pings from client {}", ip);
+                                            println!("Number of regions: {}", response.regions.len());
+
+                                            // Process the ping data as needed
+                                            for region_info in &response.regions {
+                                                println!("Region: {}, Latency: {}ms, Last updated: {}", 
+                                                         region_info.region, 
+                                                         region_info.latency,
+                                                         region_info.last_updated);
+                                            }
+                                        }
+
+                                        // Store the ping data for later use
+                                        if let Ok(mut locked_client_data) = client_data.lock() {
+                                            // Store the photon ping data
+                                            locked_client_data.photon_pings = Some(response.regions);
+                                            // Mark that we're no longer waiting for photon pings
+                                            locked_client_data.waiting_for_photon_pings = false;
+
+                                            // Acknowledge receipt
+                                            let _ = locked_client_data.client.send_message(&OwnedMessage::Text(
+                                                "Photon ping data received".to_string()
+                                            ));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        println!("Error parsing photon ping data from client {}: {:?}", ip, e);
+                                    }
+                                }
                             } else {
                                 // Echo text messages back to the client
                                 if let Ok(mut locked_client_data) = client_data.lock() {
@@ -346,7 +480,9 @@ fn main() {
                                     locked_client_data.add_ping(now, latency);
                                 }
 
-                                println!("Round-trip latency for client {}: {} ms", ip, latency);
+                                if cfg!(debug_assertions) {
+                                    println!("Round-trip latency for client {}: {} ms", ip, latency);
+                                }
                             } else {
                                 println!("Received pong with invalid data format from {}", ip);
                             }

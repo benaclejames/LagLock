@@ -10,3 +10,4 @@ dns-lookup = "2.0.4"
 rand = "0.6.5"
 num_enum = "0.7.3"
 crossbeam-channel = "0.5.15"
+serde = { version = "1.0.219", features = ["derive"] }
