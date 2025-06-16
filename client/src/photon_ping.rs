@@ -1,4 +1,3 @@
-use std::time::SystemTime;
 use photon;
 
 pub async fn fetch_regions_once() -> Vec<photon::PhotonRegion> {

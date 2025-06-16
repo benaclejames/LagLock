@@ -8,7 +8,6 @@ use websocket::sync::Server;
 use websocket::OwnedMessage;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
 use crate::models::{ClientsRegistry, DEFAULT_PHOTON_TARGET_REGION, PhotonPingsResponse};
 use crate::message_handler::{send_play_message_to_all, request_photon_pings_from_all};
@@ -31,7 +30,7 @@ fn main() {
         // Spawn a new thread for each connection
         thread::spawn(move || {
             // Accept the connection
-            if let Ok(mut websocket_client) = connection.accept() {
+            if let Ok(websocket_client) = connection.accept() {
                 println!("Client connected");
 
                 // Get the client's IP address
@@ -56,7 +55,6 @@ fn main() {
 
                 // Clone for ping thread
                 let ping_client_data = client_data.clone();
-                let ping_thread_clients = thread_clients.clone();
 
                 // Spawn a thread to send ping messages every 2 seconds
                 thread::spawn(move || {
@@ -288,9 +286,6 @@ fn main() {
                             } else {
                                 println!("Received pong with invalid data format from {}", ip);
                             }
-                        }
-                        _ => {
-                            // Ignore other message types
                         }
                     }
                 }

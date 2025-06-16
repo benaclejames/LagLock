@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use websocket::OwnedMessage;
-use crate::models::{ClientsRegistry, DEFAULT_PHOTON_TARGET_REGION};
+use crate::models::{ClientsRegistry};
 
 // Function to get the highest RTT among all connected clients
 pub fn get_highest_rtt(clients: &ClientsRegistry, target_region: &str) -> u128 {

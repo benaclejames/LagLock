@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::thread;
 use websocket::{ClientBuilder, OwnedMessage};
-use crate::models::{RegionPingData, get_ping_data_json};
+use crate::models::{get_ping_data_json};
 use crate::photon_ping::{fetch_regions_once, ping_cached_regions};
 
 fn main() {
-    let mut client = ClientBuilder::new("ws://127.0.0.1:8080")
+    let client = ClientBuilder::new("ws://127.0.0.1:8080")
         .unwrap()
         .connect_insecure()
         .unwrap();

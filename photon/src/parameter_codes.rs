@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const APPLICATION_ID: u8 = 224;
 pub const SECRET: u8 = 221;
 pub const APP_VERSION: u8 = 220;

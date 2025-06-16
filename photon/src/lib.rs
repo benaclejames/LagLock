@@ -148,6 +148,10 @@ fn deserialize_message_and_callback(stream: &mut StreamBuffer, sender: &mut Writ
         7 => {
             // Operation response
             let operation_response = deserialize_operation_response(stream);
+            if operation_response.return_code != 0 {
+                println!("Operation with opcode {} failed with msg {:?}", operation_response.operation_code, operation_response.debug_message);
+            }
+            
             println!("Operation Response: {:?}", operation_response);
             match operation_response.operation_code {
                 photon_codes::PING => {
