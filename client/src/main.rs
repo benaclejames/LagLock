@@ -1,6 +1,5 @@
 mod models;
 mod photon_ping;
-mod background_pinger;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -8,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::thread;
 use websocket::{ClientBuilder, OwnedMessage};
 use crate::models::{RegionPingData, get_ping_data_json};
-use crate::background_pinger::start_background_pinger;
+use crate::photon_ping::{fetch_regions_once, ping_cached_regions};
 
 fn main() {
     let mut client = ClientBuilder::new("ws://127.0.0.1:8080")
@@ -17,8 +16,6 @@ fn main() {
         .unwrap();
 
     let ping_data = Arc::new(Mutex::new(HashMap::new()));
-
-    start_background_pinger(Arc::clone(&ping_data));
 
     let (mut receiver, mut sender) = client.split().unwrap();
 
@@ -96,8 +93,58 @@ fn main() {
                         ""
                     };
 
+                    if cfg!(debug_assertions) {
+                        println!("Starting on-demand ping for region: {}", target_region);
+                    }
+
+                    // Create a tokio runtime for async operations
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+
+                    // Fetch regions
+                    let regions = rt.block_on(fetch_regions_once());
+
+                    // Filter regions if a specific one is requested
+                    let regions_to_ping = if !target_region.is_empty() {
+                        regions.into_iter()
+                            .filter(|r| r.short_name == target_region)
+                            .collect::<Vec<_>>()
+                    } else {
+                        regions
+                    };
+
+                    if regions_to_ping.is_empty() {
+                        println!("No matching regions found for: {}", target_region);
+                        // Send an empty response
+                        let json_data = get_ping_data_json(&ping_data, target_region);
+                        sender.send_message(&OwnedMessage::Text(json_data));
+                        continue;
+                    }
+
+                    // Ping the regions
+                    let ping_results = rt.block_on(ping_cached_regions(&regions_to_ping));
+
+                    // Update the ping data
+                    {
+                        let mut data = ping_data.lock().unwrap();
+                        let now = SystemTime::now();
+
+                        for (region, latency) in ping_results {
+                            let region_name = region.short_name.clone();
+                            data.insert(region_name.clone(), (latency, now));
+
+                            if cfg!(debug_assertions) {
+                                println!("Region {}: {}ms", region_name, latency);
+                            }
+                        }
+                    }
+
+                    // Send the ping data back to the server
                     let json_data = get_ping_data_json(&ping_data, target_region);
                     sender.send_message(&OwnedMessage::Text(json_data));
+
+                    if cfg!(debug_assertions) {
+                        println!("On-demand ping cycle finished.");
+                    }
                 }
             }
             _ => {
