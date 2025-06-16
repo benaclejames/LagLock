@@ -1,216 +1,18 @@
+mod models;
+mod client_data;
+mod message_handler;
+
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use websocket::sync::Server;
 use websocket::OwnedMessage;
 use std::sync::{Arc, Mutex};
-use std::collections::{VecDeque, HashMap};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use serde::{Serialize, Deserialize};
 
-#[derive(Serialize, Deserialize)]
-struct RegionPingInfo {
-    region: String,
-    latency: u128,
-    last_updated: u128,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PhotonPingsResponse {
-    regions: Vec<RegionPingInfo>,
-}
-
-// Structure to store client data including ping history
-struct ClientData {
-    // The WebSocket client
-    client: websocket::sync::Client<std::net::TcpStream>,
-    // History of ping latencies with timestamps (timestamp, latency in ms)
-    ping_history: VecDeque<(u128, u128)>,
-    // Smoothed ping (average over last 30 seconds)
-    smoothed_ping: Option<u128>,
-    // Photon ping data received from client
-    photon_pings: Option<Vec<RegionPingInfo>>,
-    // Flag to indicate if we're waiting for photon ping data
-    waiting_for_photon_pings: bool,
-}
-
-impl ClientData {
-    // Create a new ClientData instance
-    fn new(client: websocket::sync::Client<std::net::TcpStream>) -> Self {
-        ClientData {
-            client,
-            ping_history: VecDeque::new(),
-            smoothed_ping: None,
-            photon_pings: None,
-            waiting_for_photon_pings: false,
-        }
-    }
-
-    // Add a new ping latency to the history and update the smoothed ping
-    fn add_ping(&mut self, timestamp: u128, latency: u128) {
-        // Add the new ping to the history
-        self.ping_history.push_back((timestamp, latency));
-
-        // Calculate the smoothed ping (average of pings in the last 30 seconds)
-        self.update_smoothed_ping();
-
-        // Log the current ping and smoothed ping if in debug mode
-        if cfg!(debug_assertions) {
-            println!("Current ping: {} ms, Smoothed ping: {} ms", 
-                     latency, 
-                     self.smoothed_ping.unwrap_or(0));
-        }
-    }
-
-    // Update the smoothed ping based on the ping history
-    fn update_smoothed_ping(&mut self) {
-        // Get the current time
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis();
-
-        // Keep only pings from the last 30 seconds
-        let thirty_seconds_ago = now - 30_000;
-        while let Some((timestamp, _)) = self.ping_history.front() {
-            if *timestamp < thirty_seconds_ago {
-                self.ping_history.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        // Calculate the average ping if we have any data
-        if !self.ping_history.is_empty() {
-            let sum: u128 = self.ping_history.iter().map(|(_, latency)| latency).sum();
-            self.smoothed_ping = Some(sum / self.ping_history.len() as u128);
-        } else {
-            self.smoothed_ping = None;
-        }
-    }
-}
-
-// Create a type alias for our clients registry
-type ClientsRegistry = Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<ClientData>>>>>;
-
-// Default target region for photon pings
-const DEFAULT_TARGET_REGION: &str = "us";
-
-// Function to get the highest RTT among all connected clients
-fn get_highest_rtt(clients: &ClientsRegistry, target_region: &str) -> u128 {
-    let locked_clients = clients.lock().unwrap();
-    let mut highest_server_ping = 0;
-    let mut highest_photon_ping = 0;
-
-    for (_, client_data) in locked_clients.iter() {
-        if let Ok(locked_client) = client_data.lock() {
-            // Check server-client ping
-            if let Some(rtt) = locked_client.smoothed_ping {
-                highest_server_ping = highest_server_ping.max(rtt);
-            }
-
-            // Check photon pings if available
-            if let Some(photon_pings) = &locked_client.photon_pings {
-                for ping_info in photon_pings {
-                    // Only consider pings for the target region
-                    if ping_info.region == target_region {
-                        highest_photon_ping = highest_photon_ping.max(ping_info.latency);
-                    }
-                }
-            }
-        }
-    }
-
-    // Return the sum of the highest server ping and the highest photon ping
-    highest_server_ping + highest_photon_ping
-}
-
-// Function to send a play message to all clients with a future timestamp
-fn send_play_message_to_all(clients: &ClientsRegistry, message: &str, target_region: &str) {
-    // First, request photon pings from all clients for the target region
-    println!("Requesting photon pings from all clients for region {} before sending play message", target_region);
-    request_photon_pings_from_all(clients, target_region);
-
-    // Wait for all clients to respond with their photon pings (with a timeout)
-    let max_wait_time = Duration::from_secs(2); // Maximum wait time of 2 seconds
-    let start_time = SystemTime::now();
-
-    let mut all_clients_responded = false;
-    while !all_clients_responded && SystemTime::now().duration_since(start_time).unwrap() < max_wait_time {
-        // Check if all clients have responded
-        all_clients_responded = true;
-
-        let locked_clients = clients.lock().unwrap();
-        for (_, client_data) in locked_clients.iter() {
-            if let Ok(locked_client) = client_data.lock() {
-                if locked_client.waiting_for_photon_pings {
-                    // At least one client is still waiting for photon pings
-                    all_clients_responded = false;
-                    break;
-                }
-            }
-        }
-
-        if !all_clients_responded {
-            // Sleep a short time before checking again
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    if !all_clients_responded {
-        println!("Not all clients responded with photon pings within the timeout period");
-    } else {
-        println!("All clients responded with photon pings");
-    }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_millis();
-
-    // Get the highest RTT among all clients (sum of highest server ping and highest photon ping for the target region)
-    let highest_rtt = get_highest_rtt(clients, target_region);
-    println!("Highest RTT (sum of highest server ping and highest photon ping for region {}): {} ms", target_region, highest_rtt);
-
-    // Calculate a future timestamp that gives all clients enough time to receive and process the message
-    // We multiply by 1.5 to add some buffer
-    let future_timestamp = now + (highest_rtt * 3 / 2);
-
-    // Create the play message with the future timestamp
-    let play_message = format!("PLAY:{}:{}:{}", future_timestamp, message, highest_rtt);
-
-    // Send the message to all clients
-    let locked_clients = clients.lock().unwrap();
-    for (addr, client_data) in locked_clients.iter() {
-        if let Ok(mut locked_client) = client_data.lock() {
-            match locked_client.client.send_message(&OwnedMessage::Text(play_message.clone())) {
-                Ok(_) => println!("Sent play message to client {}", addr),
-                Err(e) => println!("Error sending play message to client {}: {:?}", addr, e),
-            }
-        }
-    }
-
-    println!("Sent play message to all clients with future timestamp: {}", future_timestamp);
-}
-
-fn request_photon_pings_from_all(clients: &ClientsRegistry, target_region: &str) {
-    for (addr, client_data) in clients.lock().unwrap().iter() {
-        if let Ok(mut locked_client) = client_data.lock() {
-            // Mark that we're waiting for photon pings from this client
-            locked_client.waiting_for_photon_pings = true;
-            // Clear any previous photon ping data
-            locked_client.photon_pings = None;
-
-            match locked_client.client.send_message(&OwnedMessage::Text(format!("REQUEST_PING:{}", target_region))) {
-                Ok(_) => {
-                    if cfg!(debug_assertions) {
-                        println!("Sent ping message to client {} for region {}", addr, target_region);
-                    }
-                },
-                Err(e) => println!("Error sending ping message to client {}: {:?}", addr, e),
-            }
-        }
-    }
-}
+use crate::models::{ClientsRegistry, DEFAULT_PHOTON_TARGET_REGION, PhotonPingsResponse};
+use crate::message_handler::{send_play_message_to_all, request_photon_pings_from_all};
+use crate::client_data::{ClientData, ClientDataExt};
 
 fn main() {
     // Create a WebSocket server that will listen on 127.0.0.1:8080
@@ -381,7 +183,7 @@ fn main() {
                                     (parts[0], parts[1])
                                 } else {
                                     // Format is SEND_PLAY:message, use default region
-                                    (DEFAULT_TARGET_REGION, parts[0])
+                                    (DEFAULT_PHOTON_TARGET_REGION, parts[0])
                                 };
 
                                 println!("Received command to send play message: {} for region: {}", message_content, target_region);
@@ -401,7 +203,7 @@ fn main() {
                                 let target_region = if parts.len() > 1 && !parts[1].is_empty() {
                                     parts[1]
                                 } else {
-                                    DEFAULT_TARGET_REGION
+                                    DEFAULT_PHOTON_TARGET_REGION
                                 };
 
                                 if cfg!(debug_assertions) {

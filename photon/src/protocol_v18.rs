@@ -86,7 +86,7 @@ fn write_compressed_int(stream: &mut StreamBuffer, value: i32, write_type: bool)
         }
         else if value >= -65535 {
             if value >= -255 {
-                stream.write_gp_type(GpType::Int2_);
+                stream.write_gp_type(GpType::Int1_);
                 stream.write_byte((-value) as u8);
                 return;
             }
@@ -328,8 +328,8 @@ mod tests {
         // Write debug message type (7 = String)
         buffer.write_byte(7);
 
-        // Write debug message length as compressed int (5)
-        buffer.write_byte(10); // 5 in zigzag encoding
+        // Write debug message length
+        buffer.write_byte(5);
 
         // Write debug message data "hello"
         buffer.write_byte(b'h');
